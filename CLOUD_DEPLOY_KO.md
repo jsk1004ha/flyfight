@@ -2,6 +2,22 @@
 
 `Dockerfile`과 `cloud.py`는 브라우저 없이 지속 학습하며 공개 페이지는 읽기 전용 관전이다.
 
+이미지는 Ubuntu 24.04와 Python 3.12를 사용한다. 의존성은 별도 빌드 단계의
+가상환경에 설치하며, 최종 실행 이미지에는 pip 설치 도구를 포함하지 않는다.
+PyTorch가 사용자 이름을 조회할 수 있도록 UID 10001 전용 계정을 만들고 캐시는
+`/tmp/torchinductor`에 둔다. 운영에서는 루트 파일시스템을 읽기 전용으로 유지한다.
+기본 이미지 digest가 고정되어 있어도 보안 업데이트 및 Python 의존성이 달라질 수
+있으므로 매 빌드마다 최종 이미지에 HIGH/CRITICAL 검사를 실행해야 한다.
+
+배포 전 컨테이너 확인 (PowerShell):
+
+```powershell
+Get-Content tests/container_smoke.py -Raw | docker run --rm -i --network none --read-only --tmpfs /tmp:rw,size=128m --cpus 2 --memory 4g --cap-drop ALL --security-opt no-new-privileges flyfight:test python -
+```
+
+이 검사는 학습 1회와 체크포인트 저장·복원을 확인한다. 운영 HTTP/WSS와 영구
+볼륨 재시작 검증을 대신하지는 않는다.
+
 필수 설정:
 
 - `PORT=8765`

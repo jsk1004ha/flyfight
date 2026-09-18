@@ -1,10 +1,14 @@
+# Bootstrap HTTPS trust only; no Python or OS binaries are copied from this stage.
+FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS certificates
 FROM ubuntu:24.04@sha256:b3cc40b72b93588182b5410f723c7aaf142363311c2aa993d8a453ddcbb3ae15 AS runtime
-RUN apt-get update && apt-get upgrade -y \
+COPY --from=certificates /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources \
+    && apt-get update --error-on=any && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends python3.12 libgomp1 ca-certificates \
     && apt-get clean
 
 FROM runtime AS dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends python3.12-venv \
+RUN apt-get update --error-on=any && apt-get install -y --no-install-recommends python3.12-venv \
     && python3.12 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 WORKDIR /app

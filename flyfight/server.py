@@ -24,6 +24,10 @@ from .spectator import Spectator
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def training_ready(runtime: dict, view_ready: bool, error: str | None, worker_alive: bool) -> bool:
+    return worker_alive and view_ready and error is None and runtime.get("state") == "training"
+
+
 def create_app(cfg: Config, *, open_browser: bool = False, port: int = 8765,
                public_origin: str | None = None) -> web.Application:
     if public_origin is not None:
@@ -51,7 +55,10 @@ def create_app(cfg: Config, *, open_browser: bool = False, port: int = 8765,
 
     @web.middleware
     async def local_only(request,handler):
-        if request.host not in allowed_hosts:
+        # Kubernetes probes address the Pod IP, not the public viewer host. These
+        # two read-only routes expose only a boolean and never a token or metrics.
+        probe = request.method in ("GET", "HEAD") and request.path in ("/health/live", "/health/ready")
+        if request.host not in allowed_hosts and not probe:
             raise web.HTTPForbidden(text="Unexpected Host")
         return await handler(request)
 
@@ -68,6 +75,16 @@ def create_app(cfg: Config, *, open_browser: bool = False, port: int = 8765,
         return web.json_response({**runtime,"view_ready":watch.models is not None,
                                   "train_paused":pause.is_set(),"viewer_paused":watch_paused,
                                   "viewer_speed":watch_speed,"error":last_error})
+
+    async def live(request):
+        healthy = last_error is None and runtime.get("state") not in ("error", "stopped")
+        return web.json_response({"alive":healthy},status=200 if healthy else 503,
+                                 headers={"Cache-Control":"no-store"})
+
+    async def ready(request):
+        healthy = training_ready(runtime,watch.models is not None,last_error,worker.is_alive())
+        return web.json_response({"ready":healthy},status=200 if healthy else 503,
+                                 headers={"Cache-Control":"no-store"})
 
     async def send(ws,message):
         # Slow clients lose the connection instead of accumulating unbounded snapshots.
@@ -197,6 +214,8 @@ def create_app(cfg: Config, *, open_browser: bool = False, port: int = 8765,
 
     app.router.add_get("/",home)
     app.router.add_get("/health",health)
+    app.router.add_get("/health/live",live)
+    app.router.add_get("/health/ready",ready)
     app.router.add_get("/ws",websocket)
     app.on_startup.append(startup); app.on_cleanup.append(cleanup)
     return app

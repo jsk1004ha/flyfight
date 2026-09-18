@@ -9,9 +9,9 @@ from flyfight.training import Config,convert_schema2_checkpoint,train_worker
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="FlyFight Native: synthetic RNN PPO + HTML spectator")
-    for name in ("envs","hidden","width","height","horizon","epochs","minibatch_envs","seed","threads","updates","save_every","publish_every","action_steps"):
+    for name in ("envs","hidden","width","height","horizon","epochs","minibatch_envs","seed","threads","updates","save_every","publish_every","action_steps","curriculum_updates"):
         p.add_argument("--"+name.replace("_","-"),type=int,default=getattr(Config(),name))
-    for name in ("learning_rate","gamma","gae_lambda","entropy","clip","episode_seconds","dt","turn_speed","pitch_speed","headshot_bonus"):
+    for name in ("learning_rate","gamma","gae_lambda","entropy","clip","episode_seconds","dt","turn_speed","pitch_speed","headshot_bonus","damage_reward","aim_reward","curriculum_fraction","exploration_mix","target_kl","advantage_floor","exploration_prior"):
         p.add_argument("--"+name.replace("_","-"),type=float,default=getattr(Config(),name))
     p.add_argument("--action-precision",type=int,choices=(2,3),default=None,
                    help="Yaw/pitch action grid: 2 = 0.01, 3 = 0.001; overrides --action-steps")

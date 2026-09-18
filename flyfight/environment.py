@@ -54,7 +54,9 @@ class Arena:
                  episode_seconds: float = 60, seed: int = 17, map_path: str | Path = DEFAULT_MAP,
                  action_steps: int = DEFAULT_ACTION_STEPS,
                  turn_speed: float = 2.0, pitch_speed: float = 1.0,
-                 headshot_bonus: float = 0.0):
+                 headshot_bonus: float = 0.0,
+                 damage_reward: float = 0.0, aim_reward: float = 0.0,
+                 shaping_gamma: float = .999, curriculum_fraction: float = 0.0):
         if not 1 <= count <= 4096 or not 8 <= width <= 128 or not 6 <= height <= 96:
             raise ValueError("Invalid count / observation dimensions")
         if not 0 < dt <= .1 or episode_seconds < dt:
@@ -63,6 +65,14 @@ class Arena:
         if not math.isfinite(headshot_bonus) or not 0 <= headshot_bonus <= 10:
             raise ValueError("headshot_bonus must be finite and in [0, 10]")
         self.headshot_bonus = float(headshot_bonus)
+        for name, value in (("damage_reward", damage_reward), ("aim_reward", aim_reward)):
+            if not math.isfinite(value) or not 0 <= value <= 10:
+                raise ValueError(f"{name} must be finite and in [0, 10]")
+            setattr(self, name, float(value))
+        if not math.isfinite(shaping_gamma) or not 0 <= shaping_gamma <= 1:
+            raise ValueError("shaping_gamma must be finite and in [0, 1]")
+        self.shaping_gamma = float(shaping_gamma)
+        self.curriculum_fraction = self._validated_curriculum_fraction(curriculum_fraction)
         for name, value in (("turn_speed", turn_speed), ("pitch_speed", pitch_speed)):
             if not math.isfinite(value) or not 0 < value <= 20:
                 raise ValueError(f"{name} must be finite and in (0, 20] radians/second")
@@ -91,6 +101,7 @@ class Arena:
         sy = (1-(yy.flatten()+.5)/height*2)*math.tan(vfov/2)
         self.local_rays = torch.nn.functional.normalize(torch.stack([sx, sy, torch.ones_like(sx)], -1), dim=-1)
         self.spawn_pairs = self._spawn_bank(seed)
+        self.curriculum_spawn_pairs = self._curriculum_spawn_bank() if self.curriculum_fraction else None
         shape = (count, 2)
         self.pos = torch.zeros(*shape, 2, device=self.device)
         self.yaw = torch.zeros(shape, device=self.device)
@@ -102,6 +113,19 @@ class Arena:
         self.rounds = torch.ones_like(self.steps)
         self.score = torch.zeros(shape, dtype=torch.long, device=self.device)
         self.reset(torch.ones(count, dtype=torch.bool, device=self.device), first=True)
+
+    @staticmethod
+    def _validated_curriculum_fraction(value: float) -> float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("curriculum_fraction must be finite and in [0, 1]")
+        return float(value)
+
+    def set_curriculum_fraction(self, value: float) -> None:
+        """Change the mix used by future resets without touching active episodes."""
+        fraction = self._validated_curriculum_fraction(value)
+        if fraction and self.curriculum_spawn_pairs is None:
+            self.curriculum_spawn_pairs = self._curriculum_spawn_bank()
+        self.curriculum_fraction = fraction
 
     def _spawn_bank(self, seed: int) -> torch.Tensor:
         r = np.random.default_rng(seed)
@@ -119,12 +143,44 @@ class Arena:
             raise ValueError("Not enough separated spawn pairs")
         return torch.tensor(pairs, dtype=torch.float32, device=self.device)
 
+    def _curriculum_spawn_bank(self) -> torch.Tensor:
+        distance = torch.linalg.vector_norm(self.spawn_pairs[:,0]-self.spawn_pairs[:,1],dim=-1)
+        nearby = self.spawn_pairs[(distance >= 6) & (distance <= 12)]
+        if len(nearby) == 0:
+            raise ValueError("Not enough nearby curriculum spawn pairs")
+        origins = torch.cat([
+            torch.stack([nearby[:,0,0],torch.full_like(nearby[:,0,0],self.eye_y),nearby[:,0,1]],-1),
+            torch.stack([nearby[:,1,0],torch.full_like(nearby[:,1,0],self.eye_y),nearby[:,1,1]],-1),
+        ])
+        targets = torch.cat([
+            torch.stack([nearby[:,1,0],torch.full_like(nearby[:,1,0],self.body_y),nearby[:,1,1]],-1),
+            torch.stack([nearby[:,0,0],torch.full_like(nearby[:,0,0],self.body_y),nearby[:,0,1]],-1),
+        ])
+        delta = targets-origins
+        target_distance = torch.linalg.vector_norm(delta,dim=-1)
+        box_distance,_ = self.cast_boxes(origins,torch.nn.functional.normalize(delta,dim=-1)[:,None,:])
+        visible = (box_distance[:,0]+1e-5 >= target_distance).view(2,-1).all(0)
+        result = nearby[visible]
+        if len(result) == 0:
+            raise ValueError("Not enough unobstructed curriculum spawn pairs")
+        return result
+
     @torch.no_grad()
     def reset(self, mask: torch.Tensor, *, first: bool = False) -> None:
         """Masked reset without .item(), dynamic indexing or a GPU/CPU sync."""
         choice = torch.randint(len(self.spawn_pairs), (self.count,), device=self.device, generator=self.generator)
         new_pos = self.spawn_pairs[choice]
         new_yaw = torch.rand(self.yaw.shape, device=self.device, generator=self.generator)*2*math.pi-math.pi
+        if self.curriculum_fraction > 0:
+            use_curriculum = torch.rand(self.count, device=self.device, generator=self.generator) < self.curriculum_fraction
+            curriculum_choice = torch.randint(len(self.curriculum_spawn_pairs), (self.count,), device=self.device, generator=self.generator)
+            curriculum_pos = self.curriculum_spawn_pairs[curriculum_choice]
+            toward = curriculum_pos.flip(1)-curriculum_pos
+            facing_yaw = torch.atan2(toward[...,0],toward[...,1])
+            jitter = (torch.rand(self.yaw.shape, device=self.device, generator=self.generator)*2-1)*.15
+            curriculum_yaw = facing_yaw+jitter
+            new_pos = torch.where(use_curriculum[:,None,None],curriculum_pos,new_pos)
+            new_yaw = torch.where(use_curriculum[:,None],curriculum_yaw,new_yaw)
         self.pos = torch.where(mask[:,None,None], new_pos, self.pos)
         self.yaw = torch.where(mask[:,None], new_yaw, self.yaw)
         self.pitch = torch.where(mask[:,None], 0., self.pitch)
@@ -186,6 +242,22 @@ class Arena:
         body,head = self.cast_opponent_parts(origins,rays)
         return torch.minimum(body,head)
 
+    def _aim_potential(self) -> torch.Tensor:
+        """Bounded visible-target alignment potential for each agent."""
+        p = self.pos.flatten(0,1)
+        origins = torch.stack([p[:,0],torch.full_like(p[:,0],self.eye_y),p[:,1]],-1)
+        enemy = self.pos.flip(1).flatten(0,1)
+        targets = torch.stack([enemy[:,0],torch.full_like(enemy[:,0],self.body_y),enemy[:,1]],-1)
+        delta = targets-origins
+        target_distance = torch.linalg.vector_norm(delta,dim=-1)
+        toward = torch.nn.functional.normalize(delta,dim=-1)
+        box_distance,_ = self.cast_boxes(origins,toward[:,None,:])
+        visible = box_distance[:,0]+1e-5 >= target_distance
+        sy,cy,sp,cp = self.yaw.sin(),self.yaw.cos(),self.pitch.sin(),self.pitch.cos()
+        forward = torch.stack([sy*cp,sp,cy*cp],-1).flatten(0,1)
+        alignment = (forward*toward).sum(-1).clamp(0,1)
+        return (alignment*visible).reshape(self.count,2)
+
     @torch.no_grad()
     def observe(self) -> torch.Tensor:
         origins,rays = self.directions()
@@ -221,9 +293,10 @@ class Arena:
 
     @torch.no_grad()
     def step(self, actions: torch.Tensor, *, auto_reset: bool = True) -> tuple[torch.Tensor,torch.Tensor,dict]:
-        """Simultaneous fire; only terminal +/-1, no hit/aim/move/survival reward."""
+        """Simultaneous combat with optional potential-based learning rewards."""
         if actions.shape != (self.count,2,4):
             raise ValueError(f"Expected actions {(self.count,2,4)}, got {tuple(actions.shape)}")
+        previous_potential = self._aim_potential() if self.aim_reward else torch.zeros_like(self.hp)
         self.last_action = self.decode(actions,self.action_spec.precision_steps)
         a = self.last_action
         self.yaw = (self.yaw+a[...,2]*self.turn_speed*self.dt+math.pi).remainder(2*math.pi)-math.pi
@@ -252,6 +325,7 @@ class Arena:
         hits = ((td < bd) & (td < floor_d)).reshape(self.count,2) & fired
         headshots = ((head_d < body_d) & (head_d < bd) & (head_d < floor_d)).reshape(self.count,2) & fired
         damage = torch.where(headshots,100.,self.body_damage).where(hits,0.)
+        effective_damage = torch.minimum(damage,self.hp.flip(1))
         self.hp = (self.hp-damage.flip(1)).clamp_min(0)
         killed = self.hp <= 0
         self.steps += 1
@@ -261,9 +335,19 @@ class Arena:
         self.score += (rewards > 0).long()
         outcome = rewards.clone()
         bonus = self.headshot_bonus * (headshots.float() - headshots.flip(1).float())
-        rewards = rewards + bonus
+        damage_bonus = self.damage_reward * (effective_damage-effective_damage.flip(1))/100
+        if self.aim_reward:
+            next_potential = self._aim_potential()
+            next_potential = torch.where(done[:,None],0.,next_potential)
+            aim_bonus = self.aim_reward * (self.shaping_gamma*next_potential-previous_potential)
+        else:
+            aim_bonus = torch.zeros_like(rewards)
+        rewards = rewards + bonus + damage_bonus + aim_bonus
         end = o+dr[:,0]*torch.minimum(torch.minimum(bd,td),floor_d)[:,0,None]
-        info = {"outcome":outcome,"headshot_reward":bonus,"fired":fired,"hits":hits,"headshots":headshots,"damage":damage,"ray_start":o.reshape(self.count,2,3),
+        reward_components = {"outcome":outcome,"headshot":bonus,"damage":damage_bonus,"aim":aim_bonus}
+        info = {"outcome":outcome,"headshot_reward":bonus,"damage_reward":damage_bonus,"aim_reward":aim_bonus,
+                "reward_components":reward_components,"fired":fired,"hits":hits,"headshots":headshots,"damage":damage,
+                "effective_damage":effective_damage,"ray_start":o.reshape(self.count,2,3),
                 "ray_end":end.reshape(self.count,2,3),"terminal_hp":self.hp.clone(),
                 "timeout":(self.steps >= self.max_steps) & ~killed.any(-1)}
         if auto_reset:

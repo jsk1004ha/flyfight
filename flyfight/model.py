@@ -55,17 +55,52 @@ class FlyPolicy(nn.Module):
         return self.actor(states).float(),self.critic(states).squeeze(-1).float(),states
 
 
-def action_stats(logits: torch.Tensor, actions: torch.Tensor | None = None,
-                 *, generator: torch.Generator | None = None,
-                 heads: tuple[int, ...] = HEADS) -> tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
-    sampled, logps, entropies = [], [], []
+def _policy_distributions(logits: torch.Tensor, heads: tuple[int, ...],
+                          exploration_mix: float
+                          ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Return (sampling probability, sampling log-probability, raw log-probability) per head."""
     if logits.shape[-1] != sum(heads):
         raise ValueError(f"Logit size {logits.shape[-1]} does not match action heads {heads}")
-    for i, head in enumerate(logits.split(heads,dim=-1)):
-        logp = F.log_softmax(head,dim=-1)
-        p = logp.exp()
+    if not math.isfinite(exploration_mix) or not 0 <= exploration_mix <= .5:
+        raise ValueError("exploration_mix must be finite and in [0, 0.5]")
+    out = []
+    for head in logits.split(heads, dim=-1):
+        raw_logp = F.log_softmax(head, dim=-1)
+        if exploration_mix == 0:
+            mixed_logp = raw_logp
+        else:
+            policy_term = raw_logp + math.log1p(-exploration_mix)
+            uniform_term = torch.full_like(raw_logp, math.log(exploration_mix / head.shape[-1]))
+            mixed_logp = torch.logaddexp(policy_term, uniform_term)
+        out.append((mixed_logp.exp(), mixed_logp, raw_logp))
+    return out
+
+
+def action_stats(logits: torch.Tensor, actions: torch.Tensor | None = None,
+                 *, generator: torch.Generator | None = None,
+                 heads: tuple[int, ...] = HEADS,
+                 exploration_mix: float = 0.0) -> tuple[torch.Tensor,torch.Tensor,torch.Tensor]:
+    """Sample/evaluate the exact behavior policy, including optional uniform mixing."""
+    sampled, logps, entropies = [], [], []
+    for i, (p, logp, _) in enumerate(_policy_distributions(logits, heads, exploration_mix)):
         a = torch.multinomial(p,1,generator=generator).squeeze(-1) if actions is None else actions[...,i]
         sampled.append(a)
         logps.append(logp.gather(-1,a.unsqueeze(-1)).squeeze(-1))
         entropies.append(-(p*logp).sum(-1))
     return torch.stack(sampled,-1),torch.stack(logps,-1).sum(-1),torch.stack(entropies,-1).sum(-1)
+
+
+def exploration_regularizer(logits: torch.Tensor, *, heads: tuple[int, ...] = HEADS
+                            ) -> torch.Tensor:
+    """Uniform-to-policy cross entropy; unlike entropy, it recovers saturated logits."""
+    if logits.shape[-1] != sum(heads):
+        raise ValueError(f"Logit size {logits.shape[-1]} does not match action heads {heads}")
+    return torch.stack([-F.log_softmax(head, dim=-1).mean(-1)
+                        for head in logits.split(heads, dim=-1)], -1).sum(-1)
+
+
+def action_head_entropies(logits: torch.Tensor, *, heads: tuple[int, ...] = HEADS,
+                          exploration_mix: float = 0.0) -> torch.Tensor:
+    """Per-head behavior-policy entropy for telemetry."""
+    distributions = _policy_distributions(logits, heads, exploration_mix)
+    return torch.stack([-(p*logp).sum(-1) for p, logp, _ in distributions], -1)

@@ -46,6 +46,12 @@ def main():
         raise RuntimeError('Mount a persistent, writable run directory before starting cloud training')
     port = int(os.environ.get('PORT', '8765'))
     cfg = cloud_config(directory)
+    profile = os.environ.get('FLYFIGHT_LEARNING_PROFILE', 'combat-v1')
+    if profile == 'combat-v1':
+        from flyfight.learning_profile import prepare_combat_run
+        cfg = prepare_combat_run(directory, cfg)
+    elif profile != 'legacy':
+        raise RuntimeError('FLYFIGHT_LEARNING_PROFILE must be combat-v1 or legacy')
     web.run_app(create_app(cfg,port=port,public_origin=origin),host='0.0.0.0',port=port)
 
 

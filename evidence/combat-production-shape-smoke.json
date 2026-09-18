@@ -1,0 +1,19 @@
+{
+  "purpose": "Single-update runtime smoke, not a learned-skill evaluation",
+  "device": "cpu",
+  "hidden": 768,
+  "envs": 8,
+  "horizon": 64,
+  "action_steps": 201,
+  "profile": "combat-v1",
+  "env_steps": 512,
+  "raw_entropy": 12.908796310424805,
+  "behavior_entropy": 12.9088716506958,
+  "approx_kl": 0.00040047234506346285,
+  "shots": 215,
+  "hits": 5,
+  "headshots": 0,
+  "curriculum_fraction": 0.8,
+  "env_steps_s": 156.30643498134222,
+  "limitations": "Local CPU sample with other validation work active; easy starts enabled; not production throughput or improved learned combat ability."
+}

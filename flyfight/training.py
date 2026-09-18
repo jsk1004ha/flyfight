@@ -10,6 +10,7 @@ from dataclasses import dataclass, asdict
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -19,7 +20,8 @@ from contextlib import nullcontext
 import torch
 from .actions import ActionSpec, action_steps_from_config, migrate_actor_tensor
 from .environment import Arena, DEFAULT_MAP
-from .model import FlyPolicy,action_stats
+from .live_view import LiveTrainingView
+from .model import FlyPolicy,action_head_entropies,action_stats,exploration_regularizer
 
 
 @dataclass
@@ -54,6 +56,14 @@ class Config:
     turn_speed: float = 2.0
     pitch_speed: float = 1.0
     headshot_bonus: float = .25
+    damage_reward: float = 0.0
+    aim_reward: float = 0.0
+    curriculum_fraction: float = 0.0
+    curriculum_updates: int = 0
+    exploration_mix: float = 0.0
+    exploration_prior: float = 0.0
+    target_kl: float = 0.0
+    advantage_floor: float = 1e-8
 
 
 def choose_device(request: str) -> torch.device:
@@ -71,6 +81,25 @@ def bounded_put(q, value) -> None:
     """Never let a slow spectator block training."""
     if q is None:
         return
+    try:
+        q.put_nowait(value)
+    except queue.Full:
+        pass
+
+
+def bounded_put_latest(q, value) -> None:
+    """Replace a stale one-slot viewer sample without ever waiting on a client."""
+    if q is None:
+        return
+    try:
+        q.put_nowait(value)
+        return
+    except queue.Full:
+        pass
+    try:
+        q.get_nowait()
+    except queue.Empty:
+        pass
     try:
         q.put_nowait(value)
     except queue.Full:
@@ -104,6 +133,18 @@ class Trainer:
             raise ValueError("Batch, horizon, epochs, intervals and threads must be positive")
         if not (0 < cfg.gamma <= 1 and 0 <= cfg.gae_lambda <= 1 and 0 < cfg.clip < 1 and cfg.entropy >= 0):
             raise ValueError("Invalid PPO parameters")
+        if not (math.isfinite(cfg.exploration_mix) and 0 <= cfg.exploration_mix <= .5):
+            raise ValueError("exploration_mix must be finite and in [0, 0.5]")
+        if not (math.isfinite(cfg.exploration_prior) and cfg.exploration_prior >= 0):
+            raise ValueError("exploration_prior must be finite and non-negative")
+        if not (math.isfinite(cfg.target_kl) and cfg.target_kl >= 0):
+            raise ValueError("target_kl must be finite and non-negative")
+        if not (math.isfinite(cfg.advantage_floor) and cfg.advantage_floor > 0):
+            raise ValueError("advantage_floor must be finite and positive")
+        if not (math.isfinite(cfg.curriculum_fraction) and 0 <= cfg.curriculum_fraction <= 1):
+            raise ValueError("curriculum_fraction must be finite and in [0, 1]")
+        if isinstance(cfg.curriculum_updates, bool) or not isinstance(cfg.curriculum_updates, int) or cfg.curriculum_updates < 0:
+            raise ValueError("curriculum_updates must be a non-negative integer")
         self.action_spec = ActionSpec(cfg.action_steps)
         self.cfg,self.device = cfg,choose_device(cfg.device)
         torch.set_num_threads(cfg.threads)
@@ -118,7 +159,9 @@ class Trainer:
         self.env = Arena(cfg.envs,self.device,width=cfg.width,height=cfg.height,dt=cfg.dt,
                          episode_seconds=cfg.episode_seconds,seed=cfg.seed,map_path=cfg.map_path,
                          action_steps=cfg.action_steps,turn_speed=cfg.turn_speed,pitch_speed=cfg.pitch_speed,
-                         headshot_bonus=cfg.headshot_bonus)
+                         headshot_bonus=cfg.headshot_bonus,damage_reward=cfg.damage_reward,
+                         aim_reward=cfg.aim_reward,shaping_gamma=cfg.gamma,
+                         curriculum_fraction=cfg.curriculum_fraction)
         first = FlyPolicy(cfg.width,cfg.height,cfg.hidden,cfg.action_steps).to(self.device)
         self.models = [first,copy.deepcopy(first)]
         self.optimizers = [torch.optim.Adam(m.parameters(),lr=cfg.learning_rate,eps=1e-5) for m in self.models]
@@ -127,6 +170,11 @@ class Trainer:
         self.wins = [0,0]
         self.model_fns = list(self.models)
         self.map_hash = hashlib.sha256(Path(cfg.map_path).read_bytes()).hexdigest()
+        self.live_view = LiveTrainingView(cfg)
+        self.live_queue = None
+        self.live_subscribers = None
+        self.live_interval = 1 / 15
+        self._last_live_sample = -float("inf")
         if cfg.resume:
             self.load(Path(cfg.resume))
         if cfg.compile_policy:
@@ -136,28 +184,48 @@ class Trainer:
     def autocast(self):
         return torch.autocast("cuda",dtype=torch.bfloat16) if self.cfg.amp else nullcontext()
 
+    def _set_curriculum(self) -> None:
+        if self.cfg.curriculum_updates:
+            remaining = max(0.0, 1.0-self.update/self.cfg.curriculum_updates)
+            self.env.set_curriculum_fraction(self.cfg.curriculum_fraction*remaining)
+        else:
+            self.env.set_curriculum_fraction(self.cfg.curriculum_fraction)
+
     @torch.no_grad()
     def collect(self) -> dict:
         cfg = self.cfg
+        self._set_curriculum()
         starts = [h.clone() for h in self.h]
         observations,previous,actions,logps,values,rewards,dones,fired,hits,headshots = ([] for _ in range(10))
         outcomes = []
-        for _ in range(cfg.horizon):
+        for rollout_step in range(cfg.horizon):
             rgb = self.env.observe()
             prev = self.env.last_action
             aa,ll,vv,hh = [],[],[],[]
             with self.autocast():
                 for i,m in enumerate(self.model_fns):
                     logits,value,hidden = m(rgb[:,i],prev[:,i],self.h[i])
-                    action,logp,_ = action_stats(logits,heads=self.action_spec.heads)
+                    action,logp,_ = action_stats(logits,heads=self.action_spec.heads,
+                                                 exploration_mix=cfg.exploration_mix)
                     aa.append(action); ll.append(logp); vv.append(value); hh.append(hidden)
             act = torch.stack(aa,1)
-            reward,done,info = self.env.step(act)
+            # Delay terminal reset until after an optional live sample so a
+            # result event is never paired with the next round's spawn/HP.
+            reward,done,info = self.env.step(act,auto_reset=False)
             observations.append(rgb); previous.append(prev); actions.append(act)
             logps.append(torch.stack(ll,1)); values.append(torch.stack(vv,1))
             rewards.append(reward); dones.append(done)
             outcomes.append(info["outcome"])
             fired.append(info["fired"]); hits.append(info["hits"]); headshots.append(info["headshots"])
+            now = time.monotonic()
+            live_active = self.live_subscribers is not None and self.live_subscribers.is_set()
+            if live_active and now-self._last_live_sample >= self.live_interval:
+                env_step = self.env_steps+(rollout_step+1)*cfg.envs
+                frame = self.live_view.frame(
+                    self.env,rgb,hh,info,update=self.update,env_step=env_step)
+                bounded_put_latest(self.live_queue,frame)
+                self._last_live_sample = now
+            self.env.reset(done)
             self.h = [v*(~done)[:,None] for v in hh]
         rgb = self.env.observe()
         with self.autocast():
@@ -176,9 +244,26 @@ class Trainer:
         losses = []
         norms = []
         entropies = []
+        normalized_entropies = []
+        head_entropy_totals = torch.zeros(len(self.action_spec.heads),device=self.device)
+        raw_entropies = []
+        raw_normalized_entropies = []
+        raw_head_entropy_totals = torch.zeros(len(self.action_spec.heads),device=self.device)
+        entropy_batches = 0
+        approx_kls = []
+        clip_fractions = []
+        kl_early_stops = 0
+        advantage_stds = []
+        advantage_scales = []
+        max_entropy = sum(math.log(size) for size in self.action_spec.heads)
         for i,(model,optim) in enumerate(zip(self.model_fns,self.optimizers)):
             adv = data["advantages"][:,:,i]
-            adv = (adv-adv.mean())/(adv.std(unbiased=False)+1e-8)
+            advantage_std = adv.std(unbiased=False)
+            advantage_scale = advantage_std.clamp_min(cfg.advantage_floor)
+            advantage_stds.append(advantage_std.detach())
+            advantage_scales.append(advantage_scale.detach())
+            adv = (adv-adv.mean())/advantage_scale
+            stop_agent = False
             for _ in range(cfg.epochs):
                 permutation = torch.randperm(cfg.envs,device=self.device)
                 for start in range(0,cfg.envs,cfg.minibatch_envs):
@@ -187,31 +272,79 @@ class Trainer:
                     with self.autocast():
                         if cfg.compile_policy or not cfg.batch_sequence_encoder:
                             # Compiled modules expose only forward reliably across PyTorch versions.
-                            ll,vv,ee = [],[],[]
+                            ll,vv,ee,zz = [],[],[],[]
                             for t in range(cfg.horizon):
                                 logits,value,h = model(data["rgb"][t,idx,i],data["prev"][t,idx,i],h)
-                                _,lp,entropy = action_stats(logits,data["actions"][t,idx,i],heads=self.action_spec.heads)
-                                ll.append(lp); vv.append(value); ee.append(entropy)
+                                _,lp,entropy = action_stats(
+                                    logits,data["actions"][t,idx,i],heads=self.action_spec.heads,
+                                    exploration_mix=cfg.exploration_mix)
+                                ll.append(lp); vv.append(value); ee.append(entropy); zz.append(logits)
                                 h = h*(~data["dones"][t,idx])[:,None]
-                            lp,value,entropy = torch.stack(ll),torch.stack(vv),torch.stack(ee)
+                            logits,lp,value,entropy = (torch.stack(zz),torch.stack(ll),
+                                                       torch.stack(vv),torch.stack(ee))
                         else:
                             logits,value,_ = model.forward_sequence(
                                 data["rgb"][:,idx,i],data["prev"][:,idx,i],h,data["dones"][:,idx])
-                            _,lp,entropy = action_stats(logits,data["actions"][:,idx,i],heads=self.action_spec.heads)
-                        ratio = (lp-data["logps"][:,idx,i]).exp()
+                            _,lp,entropy = action_stats(
+                                logits,data["actions"][:,idx,i],heads=self.action_spec.heads,
+                                exploration_mix=cfg.exploration_mix)
+                        log_ratio = lp-data["logps"][:,idx,i]
+                        ratio = log_ratio.exp()
+                        approx_kl = ((ratio-1)-log_ratio).mean()
+                        clip_fraction = ((ratio-1).abs() > cfg.clip).float().mean()
+                        mean_entropy = entropy.mean().detach()
+                        head_entropies = action_head_entropies(
+                            logits.detach(),heads=self.action_spec.heads,
+                            exploration_mix=cfg.exploration_mix).mean(tuple(range(logits.ndim-1)))
+                        raw_head_entropies = action_head_entropies(
+                            logits.detach(),heads=self.action_spec.heads).mean(tuple(range(logits.ndim-1)))
+                        raw_mean_entropy = raw_head_entropies.sum()
+                        approx_kls.append(approx_kl.detach())
+                        clip_fractions.append(clip_fraction.detach())
+                        entropies.append(mean_entropy)
+                        normalized_entropies.append(mean_entropy/max_entropy)
+                        head_entropy_totals += head_entropies
+                        raw_entropies.append(raw_mean_entropy)
+                        raw_normalized_entropies.append(raw_mean_entropy/max_entropy)
+                        raw_head_entropy_totals += raw_head_entropies
+                        entropy_batches += 1
+                        if cfg.target_kl and approx_kl.detach().item() > cfg.target_kl*1.5:
+                            kl_early_stops += 1
+                            stop_agent = True
+                            break
                         a = adv[:,idx]
                         pg = -torch.minimum(ratio*a,ratio.clamp(1-cfg.clip,1+cfg.clip)*a).mean()
                         value_loss = .5*(value-data["returns"][:,idx,i]).square().mean()
                         loss = pg+.5*value_loss-cfg.entropy*entropy.mean()
+                        if cfg.exploration_prior:
+                            loss = loss+cfg.exploration_prior*exploration_regularizer(
+                                logits,heads=self.action_spec.heads).mean()
                     if not torch.isfinite(loss):
                         raise FloatingPointError("Non-finite PPO loss. Stop and inspect the checkpoint/config.")
                     optim.zero_grad(set_to_none=True)
                     loss.backward()
                     norm = torch.nn.utils.clip_grad_norm_(self.models[i].parameters(),.5,error_if_nonfinite=True)
                     optim.step()
-                    losses.append(loss.detach()); norms.append(norm.detach()); entropies.append(entropy.mean().detach())
-        return {"loss":torch.stack(losses).mean().item(),"grad_norm":torch.stack(norms).mean().item(),
-                "entropy":torch.stack(entropies).mean().item()}
+                    losses.append(loss.detach()); norms.append(norm.detach())
+                if stop_agent:
+                    break
+        head_entropy_means = (head_entropy_totals/max(entropy_batches,1)).cpu().tolist()
+        raw_head_entropy_means = (raw_head_entropy_totals/max(entropy_batches,1)).cpu().tolist()
+        return {"loss":torch.stack(losses).mean().item() if losses else 0.0,
+                "grad_norm":torch.stack(norms).mean().item() if norms else 0.0,
+                "entropy":torch.stack(entropies).mean().item() if entropies else 0.0,
+                "entropy_normalized":torch.stack(normalized_entropies).mean().item() if normalized_entropies else 0.0,
+                "entropy_heads":head_entropy_means,
+                "raw_entropy":torch.stack(raw_entropies).mean().item() if raw_entropies else 0.0,
+                "raw_entropy_normalized":torch.stack(raw_normalized_entropies).mean().item() if raw_normalized_entropies else 0.0,
+                "raw_entropy_heads":raw_head_entropy_means,
+                "exploration_mix":cfg.exploration_mix,
+                "advantage_std":torch.stack(advantage_stds).mean().item(),
+                "advantage_normalization_scale":torch.stack(advantage_scales).mean().item(),
+                "advantage_floor":cfg.advantage_floor,
+                "approx_kl":torch.stack(approx_kls).mean().item() if approx_kls else 0.0,
+                "clip_fraction":torch.stack(clip_fractions).mean().item() if clip_fractions else 0.0,
+                "kl_early_stops":kl_early_stops}
 
     def iteration(self) -> dict:
         start = self._timestamp()
@@ -238,6 +371,7 @@ class Trainer:
                      collection_env_steps_s=steps/max(collection_seconds,1e-9),
                      update_shots=shots,update_hits=hits,update_headshots=headshots,
                      update_hit_rate=hits/max(shots,1),
+                     curriculum_fraction=self.env.curriculum_fraction,
                      source="synthetic RNN / recurrent PPO",
                      gpu_memory_mb=torch.cuda.max_memory_allocated(self.device)/2**20 if self.device.type=="cuda" else 0.)
         return stats
@@ -270,7 +404,11 @@ class Trainer:
         saved_steps = action_steps_from_config(data.get("config",{}))
         if saved_steps != self.cfg.action_steps:
             raise ValueError(f"Resume requires same action_steps; saved={saved_steps}")
-        for key, default in (("turn_speed", 2.0), ("pitch_speed", 1.0), ("headshot_bonus", 0.0)):
+        for key, default in (("turn_speed", 2.0), ("pitch_speed", 1.0), ("headshot_bonus", 0.0),
+                             ("damage_reward", 0.0), ("aim_reward", 0.0),
+                             ("curriculum_fraction", 0.0), ("curriculum_updates", 0),
+                             ("exploration_mix", 0.0), ("exploration_prior", 0.0),
+                             ("target_kl", 0.0), ("advantage_floor", 1e-8)):
             if data["config"].get(key, default) != getattr(self.cfg, key):
                 raise ValueError(f"Resume requires same {key}")
         for key in ("envs","hidden","width","height","dt","episode_seconds","seed"):
@@ -331,22 +469,23 @@ def convert_schema2_checkpoint(source: Path, destination: Path, *, action_steps:
     return result["conversion"]
 
 
-def train_worker(cfg_dict: dict, status_queue=None, weight_queue=None,
-                 stop_event=None,pause_event=None,save_event=None) -> None:
+def train_worker(cfg_dict: dict, status_queue=None, live_queue=None,
+                 stop_event=None,pause_event=None,save_event=None,live_subscribers=None) -> None:
     """Spawn-safe entrypoint. No HTTP/rendering work occurs inside this process."""
     cfg = Config(**cfg_dict)
     run = Path(cfg.run_dir); run.mkdir(parents=True,exist_ok=True)
     trainer = None
     # Queued telemetry must not keep a terminated worker alive.
-    for q in (status_queue,weight_queue):
+    for q in (status_queue,live_queue):
         if q is not None and hasattr(q,"cancel_join_thread"):
             q.cancel_join_thread()
     try:
         trainer = Trainer(cfg)
+        trainer.live_queue = live_queue
+        trainer.live_subscribers = live_subscribers
         (run/"config.json").write_text(json.dumps(asdict(cfg),ensure_ascii=False,indent=2),encoding="utf-8")
         if not cfg.resume:
             trainer.save(run/"initial.pt")
-        bounded_put(weight_queue,trainer.weight_blob())
         bounded_put(status_queue,{"state":"training","device":str(trainer.device),"envs":cfg.envs,"update":trainer.update})
         with (run/"metrics.jsonl").open("a",encoding="utf-8") as log:
             while not(stop_event is not None and stop_event.is_set()):
@@ -362,8 +501,6 @@ def train_worker(cfg_dict: dict, status_queue=None, weight_queue=None,
                 stats["state"] = "training"
                 log.write(json.dumps(stats,ensure_ascii=False,allow_nan=False)+"\n"); log.flush()
                 bounded_put(status_queue,stats)
-                if trainer.update%cfg.publish_every==0:
-                    bounded_put(weight_queue,trainer.weight_blob())
                 if trainer.update%cfg.save_every==0 or (save_event is not None and save_event.is_set()):
                     trainer.save(run/"latest.pt")
                     if save_event is not None:
@@ -379,6 +516,5 @@ def train_worker(cfg_dict: dict, status_queue=None, weight_queue=None,
     finally:
         if trainer is not None:
             trainer.save(run/"latest.pt")
-            bounded_put(weight_queue,trainer.weight_blob())
             bounded_put(status_queue,{"state":"stopped","update":trainer.update,"env_steps":trainer.env_steps,
                                       "device":str(trainer.device),"envs":cfg.envs})

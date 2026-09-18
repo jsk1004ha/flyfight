@@ -76,6 +76,10 @@ def main():
         page.wait_for_timeout(200)
         state=page.evaluate('window.FlyFight.getState()')
         ok('native frame activates Python mode',state['native'] and state['external'])
+        if frames[0].get('view_source') == 'training_live':
+            ok('actual training source identified',state['viewSource']=='training_live' and state['environmentIndex']==0)
+            ok('live playback cannot change training speed',page.locator('#speed').is_disabled() and page.evaluate('window.FlyFight.setSpeed(8)') is False)
+            ok('live training label is explicit','LIVE TRAINING' in page.locator('#sessionLabel').inner_text())
         ok('native map agrees with backend',state['map']['width']==frames[0]['map']['width'])
         last=next(m for m in reversed(frames) if m['type']=='frame')
         ok('positions come from actual backend',state['agents'][0]['position']==last['agents'][0]['position'])

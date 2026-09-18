@@ -43,10 +43,11 @@ async def run_checks(base: str, run: Path) -> dict:
                     if msg['type']==kind:return msg
                 raise TimeoutError(kind)
             hello=await response('hello');frames=[hello]
-            ok('map 64x48 and real neuron metadata transmitted',hello['map']['width']==64 and hello['map']['depth']==48 and len(hello['neurons'])==48)
+            ok('map and live training metadata transmitted',hello['map']['width']==64 and hello['map']['depth']==48 and len(hello['neurons'])==48 and hello['view_source']=='training_live' and hello['environment_index']==0)
             for _ in range(23):frames.append(await response('frame'))
             f=frames[-1]
             ok('actual CPU training metrics transmitted',f['training']['device']=='cpu' and f['training']['update']>0)
+            ok('frame identifies actual sampled rollout',f['view_source']=='training_live' and f['environment_index']==0 and f['env_step']>0 and f['update']>=0)
             ok('both agents transmit activity and input RGB',all(len(a['activity'])==48 and a['observation']['rgb_base64'] for a in f['agents']))
             async def command(c,**values):
                 await ws.send_json({'type':'command','command':c,**values});return await response('ack')
@@ -62,8 +63,9 @@ async def run_checks(base: str, run: Path) -> dict:
             a=await command('view_pause');ok('viewer pause does not pause learner',a['viewer_paused'] and not a['train_paused'])
             await asyncio.sleep(.8);ok('learner advances with viewer paused',(await health())['update']>u)
             await command('view_resume')
-            a=await command('view_speed',value=8);ok('8x viewer speed acknowledged without changing training',a['viewer_speed']==8 and not a['train_paused'])
-            ok('health reports viewer speed',(await health())['viewer_speed']==8)
+            await ws.send_json({'type':'command','command':'view_speed','value':8})
+            ok('live training rejects simulated playback speed',(await response('error'))['message']=='view_speed is unavailable for live training')
+            status=await health();ok('health fixes live viewer speed to realtime',status['viewer_speed']==1 and status['view_source']=='training_live')
             await ws.send_json({'type':'command','command':'exec','value':'not permitted'})
             ok('reject arbitrary command',(await response('error'))['message']=='Unsupported command')
         u=(await health())['update'];await asyncio.sleep(.7)
